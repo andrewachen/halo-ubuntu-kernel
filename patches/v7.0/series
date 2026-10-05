@@ -1,0 +1,5 @@
+#- AMD PerfOpt backport for the Ubuntu 7.0 kernel, applied in order.
+#- Source: iommu list v2 series by Mario Limonciello (lore.kernel.org
+#- linux-iommu 20260908041207.38113-1), adapted to the noble 7.0 tree.
+perfopt-1-iommu-amd.patch
+perfopt-2-drm-amdgpu.patch

@@ -1,0 +1,17 @@
+From: fixture <fixture@localhost>
+Subject: [PATCH] reject: target line absent from mini-tree
+
+Full 3/3 context, but the line the patch deletes does not exist in
+tests/fixtures/mini-tree/hello.c, so this fails at any fuzz level and
+leaves a .rej behind. Note: quilt writes rejects to stdout, so failure
+tests must capture stdout.
+--- a/hello.c
++++ b/hello.c
+@@ -1,6 +1,6 @@
+ #include <stdio.h>
+
+ void hello(void)
+ {
+-	printf("this line does not exist in the mini tree\n");
++	printf("rejected patch line\n");
+ }
