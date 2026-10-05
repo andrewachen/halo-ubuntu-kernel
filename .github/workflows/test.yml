@@ -10,6 +10,12 @@ on:
 
 permissions: {}
 
+# The runner must not be left to probe for a shell: it picked `sh -e` here
+# even though the container has bash, and `sh` (dash) rejects pipefail.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     name: make test + lint

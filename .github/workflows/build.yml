@@ -25,6 +25,13 @@ concurrency:
 
 permissions: {}
 
+# The runner must not be left to probe for a shell: it picked `sh -e` in the
+# container jobs even though the image has bash, and `sh` (dash) rejects
+# pipefail. Explicit bash for every run step, in every job.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   check:
     name: check upstream
@@ -40,7 +47,10 @@ jobs:
       re-sign: ${{ steps.decide.outputs.re-sign }}
       resign-noble: ${{ steps.decide.outputs.resign-noble }}
       resign-resolute: ${{ steps.decide.outputs.resign-resolute }}
-    runs-on: ubuntu-latest
+    # pinned: this job runs on the bare host (no container), so the
+    # ubuntu-latest → 26.04 label migration (2026-10-19) must not shift the
+    # tooling under it.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -371,7 +381,10 @@ jobs:
     # inside the script) — but never runs on a failed check, which owns the
     # decisions, and never on a cancelled run (!cancelled(), not always()).
     if: ${{ !cancelled() && needs.check.result == 'success' && (needs.check.outputs.needs-noble == 'true' || needs.check.outputs.needs-resolute == 'true' || needs.check.outputs.re-sign == 'true' || needs.check.outputs.resign-noble == 'true' || needs.check.outputs.resign-resolute == 'true') }}
-    runs-on: ubuntu-latest
+    # pinned: this job runs on the bare host (no container), so the
+    # ubuntu-latest → 26.04 label migration (2026-10-19) must not shift the
+    # tooling under it.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
       contents: write
