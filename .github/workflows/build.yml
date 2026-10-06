@@ -257,6 +257,10 @@ jobs:
         # needed before apt-get build-dep runs (the patch gate comes first).
         # gcc-14 is NOT pulled in by build-dep (noble's packaging pins gcc-13)
         # but series.env's COMPILER_OVERRIDE=gcc-14 needs it on PATH.
+        # libstdc++-14-dev likewise: tools/perf links -lstdc++ under CC, and
+        # the gcc-N driver only searches its OWN libdir for libstdc++.so —
+        # with build-dep's libstdc++-13-dev alone, gcc-14 cannot find it
+        # (first real build died exactly there; reproduced link-only).
         # ca-certificates is installed BEFORE any https use; the build's own
         # archive fetches use http://archive.ubuntu.com (still
         # signature-verified) so there is no cert bootstrap paradox.
@@ -264,7 +268,8 @@ jobs:
           set -euo pipefail
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates git gh jq quilt dpkg-dev fakeroot ccache gcc-14
+            ca-certificates git gh jq quilt dpkg-dev fakeroot ccache gcc-14 \
+            libstdc++-14-dev
       - name: Check out the repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Restore the ccache
