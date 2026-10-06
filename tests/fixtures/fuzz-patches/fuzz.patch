@@ -1,0 +1,20 @@
+From: fixture <fixture@localhost>
+Subject: [PATCH] fuzz: outermost context line altered
+
+Same change as good.patch, but the outermost (last) context line is
+altered while all remaining 3/3 context stays correct. GNU patch trims
+only trailing context when fuzzing, so this cannot apply at --fuzz=0
+and applies from fuzz=1 up. Verified: patch -p1 --fuzz=0 fails,
+--fuzz=1 applies at the intended spot. Note: quilt prints its
+"Hunk #N succeeded at ... with fuzz ..." diagnostics on stdout, so
+failure tests must capture stdout.
+--- a/hello.c
++++ b/hello.c
+@@ -1,6 +1,7 @@
+ #include <stdio.h>
+
++/* fuzz patch line */
+ void hello(void)
+ {
+ 	printf("hello from the mini tree\n");
+ } /* outermost context line altered for the fuzz fixture */

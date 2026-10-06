@@ -1,0 +1,62 @@
+# test.yml — the full test suite, shellcheck, the leak gate, and actionlint on
+# every push and PR. The suite runs in the same ubuntu:noble container family
+# the dev container uses (behavior parity); actionlint is not packaged in
+# noble, so it is installed from upstream's pinned release binary instead.
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+# The runner must not be left to probe for a shell: it picked `sh -e` here
+# even though the container has bash, and `sh` (dash) rejects pipefail.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: make test + lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    container:
+      image: ubuntu:noble
+    steps:
+      - name: Install test tooling
+        # The container runs as root: no sudo anywhere.
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git make quilt fakeroot ccache dpkg-dev gnupg \
+            python3 shellcheck curl
+      - name: Check out the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: make test
+        run: make test
+      - name: shellcheck
+        run: shellcheck scripts/*.sh box/*.sh scripts/lib/*.sh
+      - name: Leak gate (CI-safe generic mode)
+        run: scripts/check-leaks.sh --generic
+      - name: actionlint
+        # Not packaged in noble: download the pinned upstream release binary
+        # and verify it against the release's own sha256sum file.
+        run: |
+          set -euo pipefail
+          version=1.7.12
+          url="https://github.com/rhysd/actionlint/releases/download/v${version}"
+          file="actionlint_${version}_linux_amd64.tar.gz"
+          sums="actionlint_${version}_checksums.txt"
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          curl -fsSL -o "$tmp/$file" "$url/$file"
+          curl -fsSL -o "$tmp/$sums" "$url/$sums"
+          # sha256sum -c resolves the record's bare filename relative to CWD:
+          # verify from inside $tmp, where the archive was downloaded.
+          ( cd "$tmp" && grep -F "$file" "$sums" | sha256sum -c - )
+          tar -xzf "$tmp/$file" -C "$tmp" actionlint
+          "$tmp/actionlint"

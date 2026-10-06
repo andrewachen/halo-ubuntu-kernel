@@ -1,0 +1,3 @@
+out/
+*.deb
+tests/fixtures/dummy*

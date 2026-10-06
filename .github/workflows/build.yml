@@ -1,0 +1,802 @@
+# build.yml — check upstream, build changed series in per-series containers,
+# and publish the signed flat apt repo from GitHub Release assets.
+#
+# Privilege layout: the check job is unprivileged; the build jobs run in
+# containers with contents: read, no secrets, and no release access — they
+# build and upload artifacts only; the publish job is the ONLY privileged job
+# (contents: write; APT_SIGNING_KEY is scoped to its key-import step only).
+name: build
+
+on:
+  schedule:
+    # daily 05:00 UTC (GitHub cron's day-of-week range is 0-6 only; the check
+    # job sets the re-sign output itself — on Sundays via `date -u +%u`, and
+    # whenever the published index's Valid-Until is missing, unparseable, or
+    # within 3 days of expiry, so an outage followed by a non-Sunday resume
+    # still re-dates + re-signs instead of letting the index go stale).
+    - cron: 0 5 * * *
+  workflow_dispatch:
+
+# Overlapping runs must never race on the same halokN or on the same index
+# files: serialize whole runs instead of cancelling them.
+concurrency:
+  group: kernel-build
+  cancel-in-progress: false
+
+permissions: {}
+
+# The runner must not be left to probe for a shell: it picked `sh -e` in the
+# container jobs even though the image has bash, and `sh` (dash) rejects
+# pipefail. Explicit bash for every run step, in every job.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: check upstream
+    # Declared so the build/publish jobs can consume them; the values are
+    # written by the decide step through $GITHUB_OUTPUT.
+    outputs:
+      needs-noble: ${{ steps.decide.outputs.needs-noble }}
+      noble-upstream: ${{ steps.decide.outputs.noble-upstream }}
+      noble-n: ${{ steps.decide.outputs.noble-n }}
+      needs-resolute: ${{ steps.decide.outputs.needs-resolute }}
+      resolute-upstream: ${{ steps.decide.outputs.resolute-upstream }}
+      resolute-n: ${{ steps.decide.outputs.resolute-n }}
+      re-sign: ${{ steps.decide.outputs.re-sign }}
+      resign-noble: ${{ steps.decide.outputs.resign-noble }}
+      resign-resolute: ${{ steps.decide.outputs.resign-resolute }}
+    # pinned: this job runs on the bare host (no container), so the
+    # ubuntu-latest → 26.04 label migration (2026-10-19) must not shift the
+    # tooling under it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Decide what to build
+        id: decide
+        run: |
+          set -euo pipefail
+          # EVR arithmetic for the repair decision (newest_deb_version,
+          # strip_halo_suffix) comes from the repo's own lib.
+          # shellcheck source=scripts/lib/version.sh
+          . scripts/lib/version.sh
+
+          emit_needs() {  # <series> <check-upstream JSON>
+            local s="$1" json="$2"
+            [ "$(jq -r .changed <<<"$json")" = true ] || return 0
+            {
+              echo "needs-$s=true"
+              echo "$s-upstream=$(jq -r .upstream_version <<<"$json")"
+              echo "$s-n=$(jq -r .halo_n <<<"$json")"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          # The signed index is the publish's COMPLETION MARKER (debs upload
+          # first, index assets last), so it doubles as the integrity check of
+          # the last publish: the InRelease signature must verify against the
+          # pinned public key, its SHA256 section must match the Packages we
+          # just downloaded, and every Filename: in Packages must exist as a
+          # release asset. A failure means a previous publish died partway (or
+          # the index was tampered with); the live index cannot be trusted.
+          index_intact() {  # <Packages> <InRelease> — prints WHY it fails
+            local pkg="$1" inrel="$2" want got fn
+            [ -f "$inrel" ] || { echo "index check: the InRelease asset is MISSING" >&2; return 1; }
+            # the signature is verified BEFORE the parsed hashes are trusted —
+            # a forged or mangled InRelease must never count as intact
+            if ! GNUPGHOME="$check_gnupghome" gpg --verify "$inrel" >/dev/null 2>&1; then
+              echo "index check: the InRelease signature does NOT verify against the pinned key" >&2
+              return 1
+            fi
+            want=$(sha256sum "$pkg" | awk '{print $1}')
+            got=$(awk '/^SHA256:/{s=1; next} s && /^[[:space:]]*$/{s=0} s && $NF=="Packages"{print $1}' "$inrel")
+            if [ -z "$got" ] || [ "$got" != "$want" ]; then
+              echo "index check: Packages does not match InRelease's SHA256 section (TAMPERED or stale)" >&2
+              return 1
+            fi
+            while IFS= read -r fn; do
+              [ -n "$fn" ] || continue
+              if ! grep -qxF "$fn" <<<"$names"; then
+                echo "index check: asset MISSING for $fn" >&2
+                return 1
+              fi
+            done < <(sed -n 's/^Filename: //p' "$pkg")
+            return 0
+          }
+
+          # Repair path on integrity failure. Default repair: RE-SIGN the
+          # existing Packages (the publish job prunes stanzas whose asset is
+          # gone, re-dates and re-signs via its resign path). The old repair
+          # queued a REBUILD of the newest meta EVR unconditionally — which
+          # wedged the series forever once that EVR's source was superseded in
+          # its pocket (apt-get source pkg=<old> fails every day). A rebuild is
+          # only queueable while the index EVR's upstream part is still the
+          # current upstream version; anything older must be re-signed.
+          repair_series() {  # <series> <Packages> <showsrc-file>
+            local s="$1" index_file="$2" showsrc="$3" evr best_v='' v cur
+            # the NEWEST meta version in the index is the publish that broke
+            while IFS= read -r v; do
+              if [ -z "$best_v" ] || dpkg --compare-versions "$v" gt "$best_v"; then
+                best_v="$v"
+              fi
+            done < <(awk -v meta="linux-image-halo-$s" '
+              /^Package: / { inmeta = ($2 == meta) }
+              inmeta && /^Version: / { print substr($0, 10) }
+            ' "$index_file")
+            evr=$best_v
+            case "$evr" in
+              *+halok[0-9]*) ;;
+              *)
+                echo "apt-$s: broken index has no +halokN meta version — cannot compute a repair" >&2
+                return 1
+                ;;
+            esac
+            cur=$(newest_deb_version < "$showsrc") \
+              || { echo "apt-$s: cannot read the current upstream version from showsrc" >&2; return 1; }
+            if [ "$(strip_halo_suffix "$evr")" = "$cur" ]; then
+              echo "apt-$s: INDEX INTEGRITY FAILURE — $evr is still the current upstream; queueing a repair rebuild of $evr" >&2
+              {
+                echo "needs-$s=true"
+                echo "$s-upstream=$cur"
+                echo "$s-n=${evr##*+halok}"
+              } >> "$GITHUB_OUTPUT"
+            else
+              echo "apt-$s: INDEX INTEGRITY FAILURE — $evr is superseded (current upstream $cur); queueing a re-sign repair" >&2
+              echo "resign-$s=true" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+          # The InRelease signature verification above needs the pinned public
+          # key: import it into a throwaway GNUPGHOME up front.
+          check_gnupghome=$(mktemp -d)
+          chmod 700 "$check_gnupghome"
+          if ! GNUPGHOME="$check_gnupghome" gpg --batch --import \
+               keys/repo-public-key.asc >"$check_gnupghome/import.log" 2>&1; then
+            cat "$check_gnupghome/import.log" >&2
+            echo "cannot import the pinned repo public key" >&2
+            exit 1
+          fi
+
+          re_sign=false
+          if [ "$(date -u +%u)" = 7 ]; then re_sign=true; fi
+          # workflow_dispatch is the manual/recovery entry point: an operator
+          # dispatching by hand wants the index fresh, and a recovery after an
+          # outage must not wait for a Sunday.
+          if [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ]; then re_sign=true; fi
+          for s in noble resolute; do
+            tmp=$(mktemp -d)
+            scripts/check-upstream-helper.sh "$s" > "$tmp/showsrc"
+            # Only a GENUINE "no such release" counts as unpublished: any other
+            # gh failure (API error, rate limit) must fail the job loudly —
+            # silently deciding "unpublished" would over-build and later
+            # --clobber-overwrite published assets.
+            if names=$(gh release view "apt-$s" --json assets --jq '.assets[].name' 2>"$tmp/view.err"); then
+              :
+            elif grep -q 'release not found' "$tmp/view.err"; then
+              names=''
+              echo "apt-$s: release not found; treating as unpublished"
+            else
+              cat "$tmp/view.err" >&2
+              echo "apt-$s: gh release view failed — cannot decide safely" >&2
+              exit 1
+            fi
+            # The published set comes from the release's Packages file via
+            # --index (a Packages file — not --published-file's one-version-
+            # per-line form). First run ever: no Packages asset exists yet —
+            # the flag is OMITTED entirely (a missing path makes
+            # check-upstream.sh exit 1) and the series reports changed with
+            # halo_n 1.
+            index_args=()
+            if grep -qxF 'Packages' <<<"$names"; then
+              gh release download "apt-$s" --pattern Packages --dir "$tmp" --clobber
+              # A missing InRelease asset is itself a broken index (case: the
+              # last publish uploaded Packages but died before InRelease).
+              gh release download "apt-$s" --pattern InRelease --dir "$tmp" --clobber 2>/dev/null || true
+              if index_intact "$tmp/Packages" "$tmp/InRelease"; then
+                index_args=(--index "$tmp/Packages")
+                # Beyond the Sunday cadence: a resumed run after an outage must
+                # not report success while serving an index about to expire —
+                # re-sign whenever Valid-Until is missing, unparseable, or
+                # within 3 days of expiry.
+                vu=$(sed -n 's/^Valid-Until: //p' "$tmp/InRelease" | head -1)
+                vu_epoch=''
+                if [ -n "$vu" ]; then
+                  vu_epoch=$(date -u -d "$vu" +%s 2>/dev/null) || vu_epoch=''
+                fi
+                if [ -z "$vu_epoch" ] \
+                    || [ "$((vu_epoch - $(date -u +%s)))" -lt $((3 * 86400)) ]; then
+                  echo "apt-$s: index Valid-Until missing, unparseable, or within 3 days of expiry — queueing a re-sign" >&2
+                  re_sign=true
+                fi
+              else
+                repair_series "$s" "$tmp/Packages" "$tmp/showsrc"
+                rm -rf "$tmp"
+                continue
+              fi
+            else
+              echo "apt-$s: no published Packages asset yet; treating as unpublished"
+            fi
+            json=$(scripts/check-upstream.sh --series "$s" \
+              --apt-output "$tmp/showsrc" "${index_args[@]}")
+            echo "$json" | jq .
+            emit_needs "$s" "$json"
+            rm -rf "$tmp"
+          done
+          rm -rf "$check_gnupghome"
+          echo "re-sign=$re_sign" >> "$GITHUB_OUTPUT"
+
+  build-noble:
+    name: build noble
+    needs: check
+    if: needs.check.outputs.needs-noble == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    container:
+      image: ubuntu:noble
+      volumes:
+        - /mnt:/mnt
+    env:
+      # build-kernel.sh routes ccache through /usr/lib/ccache and honors this
+      CCACHE_DIR: /mnt/halo-ccache
+      # check-job outputs enter the run scripts as env, never as inline
+      # interpolations (hardened pattern)
+      UPSTREAM: '${{ needs.check.outputs.noble-upstream }}'
+      HALO_N: '${{ needs.check.outputs.noble-n }}'
+    steps:
+      - name: Install base tooling
+        # The container runs as root: no sudo anywhere. The runner-bundled
+        # gh/jq are not in the image; quilt/dpkg-dev/fakeroot/ccache are
+        # needed before apt-get build-dep runs (the patch gate comes first).
+        # gcc-14 is NOT pulled in by build-dep (noble's packaging pins gcc-13)
+        # but series.env's COMPILER_OVERRIDE=gcc-14 needs it on PATH.
+        # libstdc++-14-dev likewise: tools/perf links -lstdc++ under CC, and
+        # the gcc-N driver only searches its OWN libdir for libstdc++.so —
+        # with build-dep's libstdc++-13-dev alone, gcc-14 cannot find it
+        # (first real build died exactly there; reproduced link-only).
+        # ca-certificates is installed BEFORE any https use; the build's own
+        # archive fetches use http://archive.ubuntu.com (still
+        # signature-verified) so there is no cert bootstrap paradox.
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git gh jq quilt dpkg-dev fakeroot ccache gcc-14 \
+            libstdc++-14-dev
+      - name: Check out the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore the ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /mnt/halo-ccache
+          key: ccache-noble-${{ github.run_id }}
+          restore-keys: ccache-noble-
+      - name: Build the kernel
+        # build-kernel.sh does the whole chain: pinned source fetch, patch
+        # gate at --fuzz=0, +halokN changelog, build-dep, binary-generic, and
+        # payload self-verification. The multi-GB scratch and the debs land
+        # on /mnt, the runner's scratch volume — never the container's root
+        # fs.
+        run: |
+          set -euo pipefail
+          scripts/build-kernel.sh \
+            --series noble \
+            --upstream "$UPSTREAM" \
+            --n "$HALO_N" \
+            --output /mnt/halo-build \
+            --work-dir /mnt/halo-build \
+            --jobs "$(nproc)"
+      - name: Stage the publishable debs and the manifest
+        # manifest.json is DATA: it is written here with printf and parsed
+        # with jq in the publish job — never sourced (artifact data is
+        # untrusted in a privileged job).
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          cp /mnt/halo-build/debs/*.deb staging/
+          set -- staging/linux-image-unsigned-*-generic_*.deb
+          [ $# -eq 1 ] || { echo "expected exactly one image deb, got $#" >&2; exit 1; }
+          evr=$(dpkg-deb -f "$1" Version)
+          printf '{"series":"noble","tag":"apt-noble","evr":"%s"}\n' "$evr" \
+            > staging/manifest.json
+          jq -e . staging/manifest.json
+      - name: Upload the build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debs-noble
+          path: staging/
+          retention-days: 7
+
+  build-resolute:
+    name: build resolute
+    needs: check
+    if: needs.check.outputs.needs-resolute == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    container:
+      image: ubuntu:resolute
+      volumes:
+        - /mnt:/mnt
+    env:
+      CCACHE_DIR: /mnt/halo-ccache
+      # check-job outputs enter the run scripts as env, never as inline
+      # interpolations (hardened pattern)
+      UPSTREAM: '${{ needs.check.outputs.resolute-upstream }}'
+      HALO_N: '${{ needs.check.outputs.resolute-n }}'
+    steps:
+      - name: Install base tooling
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git gh jq quilt dpkg-dev fakeroot ccache
+      - name: Check out the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore the ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /mnt/halo-ccache
+          key: ccache-resolute-${{ github.run_id }}
+          restore-keys: ccache-resolute-
+      - name: Build the kernel
+        run: |
+          set -euo pipefail
+          scripts/build-kernel.sh \
+            --series resolute \
+            --upstream "$UPSTREAM" \
+            --n "$HALO_N" \
+            --output /mnt/halo-build \
+            --work-dir /mnt/halo-build \
+            --jobs "$(nproc)"
+      - name: Stage the publishable debs and the manifest
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          cp /mnt/halo-build/debs/*.deb staging/
+          set -- staging/linux-image-unsigned-*-generic_*.deb
+          [ $# -eq 1 ] || { echo "expected exactly one image deb, got $#" >&2; exit 1; }
+          evr=$(dpkg-deb -f "$1" Version)
+          printf '{"series":"resolute","tag":"apt-resolute","evr":"%s"}\n' "$evr" \
+            > staging/manifest.json
+          jq -e . staging/manifest.json
+      - name: Upload the build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debs-resolute
+          path: staging/
+          retention-days: 7
+
+  publish:
+    name: publish (privileged)
+    needs: [check, build-noble, build-resolute]
+    # Gated at job level so a no-op run does not even spin a runner: something
+    # must have been built, or a re-sign must be due (the Sunday cadence, an
+    # expiring/unparseable Valid-Until, workflow_dispatch, or an integrity
+    # repair). It runs even when a build job was skipped or failed — it
+    # publishes only what built (a series without its artifact is skipped
+    # inside the script) — but never runs on a failed check, which owns the
+    # decisions, and never on a cancelled run (!cancelled(), not always()).
+    if: ${{ !cancelled() && needs.check.result == 'success' && (needs.check.outputs.needs-noble == 'true' || needs.check.outputs.needs-resolute == 'true' || needs.check.outputs.re-sign == 'true' || needs.check.outputs.resign-noble == 'true' || needs.check.outputs.resign-resolute == 'true') }}
+    # pinned: this job runs on the bare host (no container), so the
+    # ubuntu-latest → 26.04 label migration (2026-10-19) must not shift the
+    # tooling under it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # the signing subkey fingerprint (public data; matches
+      # keys/repo-public-key.asc). APT_SIGNING_KEY is deliberately NOT here:
+      # a job-level env would hand the raw secret to every action and child
+      # process — it is scoped to the import step's env only.
+      SIGN_KEYID: 65ED20E95E7D7DDAD55F76C390DFA288EBF76411
+      RE_SIGN: '${{ needs.check.outputs.re-sign }}'
+      # per-series integrity-repair re-sign requests from the check job
+      RESIGN_NOBLE: '${{ needs.check.outputs.resign-noble }}'
+      RESIGN_RESOLUTE: '${{ needs.check.outputs.resign-resolute }}'
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install host tooling for the publish steps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev
+      - name: Download the noble build artifact
+        if: needs.build-noble.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debs-noble
+          path: staging-noble
+      - name: Download the resolute build artifact
+        if: needs.build-resolute.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debs-resolute
+          path: staging-resolute
+      - name: Determine the work plan
+        id: plan
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE:?}"
+          # Work plan per series: publish (this run built new debs — signaled
+          # by the downloaded artifact), resign (the Sunday/Valid-Until/
+          # dispatch re-sign, or a per-series integrity-repair re-sign), or
+          # skip. Decided here so the key import below runs ONLY when there is
+          # work; nothing to do at all = no runner time spent on secrets.
+          work=false
+          for s in noble resolute; do
+            case "$s" in
+              noble) repair_resign=${RESIGN_NOBLE:-} ;;
+              resolute) repair_resign=${RESIGN_RESOLUTE:-} ;;
+            esac
+            if [ -f "staging-$s/manifest.json" ]; then
+              mode=publish
+            elif [ "$RE_SIGN" = true ] || [ "$repair_resign" = true ]; then
+              mode=resign
+            else
+              mode=skip
+            fi
+            [ "$mode" = skip ] || work=true
+            # modes travel as env (GITHUB_ENV) so the publish step reads them
+            # as "${MODE_<S>:?}" — no inline interpolation into its script
+            echo "MODE_${s^^}=$mode" >> "$GITHUB_ENV"
+          done
+          echo "work=$work" >> "$GITHUB_OUTPUT"
+          [ "$work" = true ] || echo "Nothing built and no re-sign is due — nothing to publish."
+      - name: Import the signing key
+        if: steps.plan.outputs.work == 'true'
+        env:
+          # Scoped to THIS step's env only: a job-level APT_SIGNING_KEY would
+          # be exported to every action and child process in the job.
+          APT_SIGNING_KEY: '${{ secrets.APT_SIGNING_KEY }}'
+        run: |
+          set -euo pipefail
+          # Fresh GNUPGHOME: import the armored subkey-only export, prove the
+          # pinned signing subkey is in it, then hand the HOME (never the raw
+          # key) to the publish step via GITHUB_ENV.
+          gnupg=$(mktemp -d)
+          chmod 700 "$gnupg"
+          export GNUPGHOME="$gnupg"
+          printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --import
+          # gpg puts fingerprints in FIELD 10 of --with-colons output; the fpr
+          # lines cover primary AND subkeys, so the SIGNING SUBKEY must appear
+          # among the SECRET keys (a public-only import passes --list-keys but
+          # cannot sign — it must fail loudly here, not at signing time).
+          gpg --list-secret-keys --with-colons | awk -F: '$1=="fpr"{print $10}' \
+            | grep -qxF "${SIGN_KEYID:?}" \
+            || { echo "APT_SIGNING_KEY does not contain $SIGN_KEYID" >&2; exit 1; }
+          echo "GNUPGHOME=$gnupg" >> "$GITHUB_ENV"
+      - name: Publish and verify
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE:?}"
+
+          ORIGIN_URL=https://github.com/andrewachen/halo-ubuntu-kernel/releases/download
+          SERIES_LIST="noble resolute"
+
+          aptc() {  # <aptroot> <apt-get args...> — apt against an isolated aptroot
+            local r="$1"
+            shift
+            apt-get \
+              -o Dir::State::Lists="$r/var/lib/apt/lists" \
+              -o Dir::State::status="$r/var/lib/dpkg/status" \
+              -o Dir::Cache="$r/var/cache/apt" \
+              -o Dir::Etc::sourcelist="$r/etc/apt/sources.list" \
+              -o Dir::Etc::sourceparts=- "$@"
+          }
+
+          # The plan step's per-series modes, passed as env (not inline
+          # interpolation); a missing value fails loudly instead of defaulting.
+          declare -A MODE=()
+          for s in $SERIES_LIST; do
+            case "$s" in
+              noble) MODE[$s]=${MODE_NOBLE:?} ;;
+              resolute) MODE[$s]=${MODE_RESOLUTE:?} ;;
+            esac
+          done
+
+          # EVR→history-tag mapping lives in version.sh (its unescaped-tilde
+          # trap is documented there — do not re-implement the substitution).
+          # shellcheck source=scripts/lib/version.sh
+          . scripts/lib/version.sh
+
+          publish_series() {  # <series> <publish|resign>
+            local s="$1" mode="$2"
+            local staged="staging-$s" repo="repo-$s" dl="dl-$s"
+            local names prev='' pruned='' evr='' asset name deb first=1
+            local new_assets=() deb_list=()
+            mkdir -p "$repo" "$dl"
+
+            names=$(gh release view "apt-$s" --json assets --jq '.assets[].name' \
+              2>/dev/null || true)
+
+            if [ "$mode" = publish ]; then
+              # manifest.json is artifact data — untrusted in this privileged
+              # job. Parse it as data with jq and validate every field before
+              # use; it is never sourced or eval'd.
+              local mseries mtag
+              mseries=$(jq -r '.series // ""' "$staged/manifest.json")
+              mtag=$(jq -r '.tag // ""' "$staged/manifest.json")
+              evr=$(jq -r '.evr // ""' "$staged/manifest.json")
+              if [ "$mseries" != "$s" ]; then
+                echo "$s: manifest series '$mseries' does not match" >&2
+                return 1
+              fi
+              if [ "$mtag" != "apt-$s" ]; then
+                echo "$s: unexpected manifest tag '$mtag'" >&2
+                return 1
+              fi
+              if ! printf '%s' "$evr" \
+                  | grep -Eq '^[0-9][0-9.]*-[0-9]+(\.[^[:space:]/:]*)?$'; then
+                echo "$s: manifest evr '$evr' is not a usable EVR" >&2
+                return 1
+              fi
+            fi
+
+            # Bootstrap the rolling release with the public key as its first
+            # asset — clients fetch the key from the release itself. Existence
+            # and asset state are tracked SEPARATELY: a previous run can have
+            # created the release and died before the key upload, leaving an
+            # EXISTING release with an empty asset list — `gh release create`
+            # on it fails already-exists on every retry and wedges the series.
+            if ! gh release view "apt-$s" >/dev/null 2>&1; then
+              gh release create "apt-$s" keys/repo-public-key.asc \
+                --title "apt-$s (rolling)" \
+                --notes "Rolling flat apt repository for $s. See the repository README for usage."
+            elif ! grep -qxF 'repo-public-key.asc' <<<"$names"; then
+              gh release upload "apt-$s" keys/repo-public-key.asc
+            fi
+
+            # Existing state: the previous Packages becomes --prev-index.
+            # ONLY the index is downloaded — old debs stay untouched as release
+            # assets (Filename: points at them, and apt verifies deb hashes
+            # against the Packages stanza, not the Release), so the publish
+            # download does not grow with the repo's history. The rewritten
+            # Release hashes whatever is in the repo dir (index + new debs).
+            if grep -qxF 'Packages' <<<"$names"; then
+              gh release download "apt-$s" --pattern Packages --dir "$dl" --clobber
+              prev="$dl/Packages"
+              # Prune stanzas whose Filename: asset is missing from the
+              # release, in EVERY mode: a previous publish that died partway
+              # leaves index stanzas referencing assets that never uploaded,
+              # and keeping them would keep serving a broken index. This is
+              # also what makes an integrity-repair re-sign (the check job's
+              # repair path) safe without a rebuild.
+              pruned="$dl/Packages.pruned"
+              names="$names" awk '
+                function flush() {
+                  if (buf != "" && fn != "" && index("\n" ENVIRON["names"] "\n", "\n" fn "\n") > 0) printf "%s", buf
+                  buf = ""; fn = ""
+                }
+                /^$/ { buf = buf $0 "\n"; flush(); next }
+                { buf = buf $0 "\n"; if (/^Filename: /) fn = substr($0, 11) }
+                END { flush() }
+              ' "$prev" > "$pruned"
+              prev="$pruned"
+            fi
+
+            if [ "$mode" = publish ]; then
+              # The meta deb is built here (it is tiny) so it pins the exact
+              # EVR that was just built and validated.
+              scripts/build-meta-deb.sh --series "$s" --evr "$evr" --output "meta-$s"
+              local meta_name="linux-image-halo-${s}_${evr}_amd64.deb"
+              for deb in "$staged"/*.deb; do deb_list+=("$deb"); done
+              deb_list+=("meta-$s/$meta_name")
+              for deb in "${deb_list[@]}"; do
+                name=$(basename "$deb")
+                # the tilde in the PATTERN must be escaped or bash expands it
+                # to $HOME (scripts/lib/version.sh documents this trap)
+                asset="${name//\~/.}"
+                # The deb is handed over at its STAGED (pre-copy) path:
+                # publish-apt does the copy into the repo dir, and pointing
+                # it at the already-copied path would be a same-file cp.
+                # The first deb merges against the downloaded previous index
+                # (or starts a fresh one); the rest chain off the repo dir's
+                # own Packages so no stanza is lost.
+                if [ "$first" -eq 1 ] && [ -n "$prev" ]; then
+                  scripts/publish-apt.sh --suite "$s" --repo-dir "$repo" \
+                    --deb "$deb" --asset-name "$asset" --prev-index "$prev"
+                elif [ "$first" -eq 1 ]; then
+                  scripts/publish-apt.sh --suite "$s" --repo-dir "$repo" \
+                    --deb "$deb" --asset-name "$asset"
+                else
+                  scripts/publish-apt.sh --suite "$s" --repo-dir "$repo" \
+                    --deb "$deb" --asset-name "$asset" --prev-index "$repo/Packages"
+                fi
+                new_assets+=("$asset")
+                first=0
+              done
+            else
+              # Nothing published yet (fresh repo on a re-sign-only run):
+              # there is no index to re-sign — skip the series gracefully.
+              if [ -z "$prev" ]; then
+                echo "apt-$s: nothing published yet — nothing to re-sign"
+                return 0
+              fi
+              # Re-sign with no new debs: re-publish the NEWEST meta deb (its
+              # stanza is already in the index, so the merge is content-
+              # neutral) purely to regenerate the index with a fresh Date/
+              # Valid-Until and a fresh signature. The index names the meta
+              # debs exactly, so the newest one is downloaded by name — no
+              # guessing, and only that one deb asset is fetched.
+              local resign_v='' resign_f='' v f
+              while IFS=$'\t' read -r v f; do
+                if [ -z "$resign_v" ] || dpkg --compare-versions "$v" gt "$resign_v"; then
+                  resign_v="$v"; resign_f="$f"
+                fi
+              done < <(awk -v meta="linux-image-halo-$s" '
+                /^Package: / { inmeta = ($2 == meta) }
+                inmeta && /^Version: /  { v = substr($0, 10) }
+                inmeta && /^Filename: / { print v "\t" substr($0, 11) }
+              ' "$prev")
+              if [ -z "$resign_f" ]; then
+                echo "$s: re-sign run but the index has no meta deb" >&2
+                return 1
+              fi
+              gh release download "apt-$s" --pattern "$resign_f" --dir "$dl" --clobber
+              local resign_deb="$dl/$resign_f"
+              [ -f "$resign_deb" ] \
+                || { echo "$s: the index's meta deb '$resign_f' is not a release asset" >&2; return 1; }
+              scripts/publish-apt.sh --suite "$s" --repo-dir "$repo" \
+                --deb "$resign_deb" --asset-name "$resign_f" --prev-index "$prev"
+            fi
+
+            # file:// e2e against the staged tree (the Task 6 e2e, live): a
+            # real apt client must accept the signed index, resolve the meta
+            # against its exact pins, and download the meta deb. The Ubuntu
+            # archive is added alongside so the meta's firmware/microcode
+            # deps resolve — the repo itself carries only the kernel.
+            local root
+            root=$(mktemp -d)
+            mkdir -p "$root/etc/apt/trusted.gpg.d" \
+              "$root/var/lib/apt/lists/partial" "$root/var/lib/dpkg" \
+              "$root/var/cache/apt/archives/partial"
+            : > "$root/var/lib/dpkg/status"
+            gpg --dearmor -o "$root/etc/apt/trusted.gpg.d/halo.gpg" \
+              keys/repo-public-key.asc
+            # The Ubuntu archive side must cover everything the kernel
+            # selection reaches: amd64-microcode is in MAIN, and kernel deps
+            # can come from -updates/-security. Mirror the same pockets the
+            # build itself uses (series/<s>/series.env); multiverse is added
+            # alongside and is harmless.
+            # shellcheck disable=SC1090 # series path is a runtime arg
+            . "series/$s/series.env"
+            : "${POCKETS:?series/$s/series.env did not set POCKETS}"
+            {
+              printf 'deb [signed-by=%s/etc/apt/trusted.gpg.d/halo.gpg] file://%s/ /\n' \
+                "$root" "$PWD/$repo"
+              for p in $POCKETS; do
+                printf 'deb http://archive.ubuntu.com/ubuntu %s main multiverse\n' "$p"
+              done
+            } > "$root/etc/apt/sources.list"
+            if ! aptc "$root" update >"$root/update.log" 2>&1; then
+              cat "$root/update.log" >&2
+              return 1
+            fi
+            if ! aptc "$root" -s install "linux-image-halo-$s" \
+                >"$root/sim.txt" 2>&1; then
+              cat "$root/sim.txt" >&2
+              return 1
+            fi
+            if ! grep -q "^Inst linux-image-halo-$s " "$root/sim.txt" \
+              || ! grep -q '^Inst linux-image-unsigned-' "$root/sim.txt" \
+              || ! grep -q '^Inst linux-modules-' "$root/sim.txt"; then
+              echo "$s: e2e simulation did not select meta + image + modules:" >&2
+              cat "$root/sim.txt" >&2
+              return 1
+            fi
+            if [ "$mode" = publish ]; then
+              grep -qF "($evr " "$root/sim.txt" \
+                || { echo "$s: e2e simulation resolved the wrong version:" >&2
+                     cat "$root/sim.txt" >&2; return 1; }
+            fi
+            if ! ( cd "$root" && aptc "$root" download "linux-image-halo-$s" ) \
+                >"$root/dl.log" 2>&1; then
+              cat "$root/dl.log" >&2
+              return 1
+            fi
+            if [ "$mode" = publish ]; then
+              # apt-get download names files from the PACKAGE VERSION, and the
+              # version keeps its '~' (only the ASSET name is GitHub-safe — the
+              # '~'→'.' rename lives in the asset name and the index's
+              # Filename:) — so the landed file is the version-form name.
+              if [ ! -f "$root/linux-image-halo-${s}_${evr}_amd64.deb" ]; then
+                echo "$s: the e2e download did not land at linux-image-halo-${s}_${evr}_amd64.deb" >&2
+                ls -la "$root" >&2
+                return 1
+              fi
+            else
+              # Re-sign: apt resolves the NEWEST meta, which need not be the
+              # one re-published above — assert SOME meta deb landed. Note the
+              # ${s}_ separator: unbraced, "$s_" would expand the (unbound)
+              # variable s_ and the glob would never match.
+              local meta_landed=( "$root/linux-image-halo-${s}_"*.deb )
+              if [ ! -e "${meta_landed[0]}" ]; then
+                echo "$s: the e2e download landed no meta deb" >&2
+                ls -la "$root" >&2
+                return 1
+              fi
+            fi
+            rm -rf "$root"
+
+            # Upload debs first, the index assets LAST: the live Packages/
+            # InRelease is the completion marker — a crash before it leaves
+            # the previous (still valid) index serving, and the check job's
+            # index-integrity validation queues a repair rebuild for whatever
+            # else got lost.
+            if [ "${#new_assets[@]}" -gt 0 ]; then
+              local upload_list=()
+              for asset in "${new_assets[@]}"; do
+                upload_list+=("$repo/$asset")
+              done
+              gh release upload "apt-$s" --clobber "${upload_list[@]}"
+            fi
+            gh release upload "apt-$s" --clobber \
+              "$repo/Packages" "$repo/Packages.gz" "$repo/Release" \
+              "$repo/Release.gpg" "$repo/InRelease"
+
+            # History release AFTER the index upload: a failed upload must not
+            # leave a history release whose SHA256SUMS describe debs that were
+            # never served. Manifest + checksums only (no deb duplication);
+            # idempotent on retries — an existing history release is left
+            # alone.
+            if [ "$mode" = publish ]; then
+              local hist_tag
+              hist_tag=$(tag_for_version "$s" "$evr") \
+                || { echo "$s: cannot map EVR '$evr' to a history tag" >&2; return 1; }
+              git check-ref-format --allow-onelevel "$hist_tag" \
+                || { echo "history tag '$hist_tag' is not a valid tag name" >&2; return 1; }
+              if ! gh release view "$hist_tag" > /dev/null 2>&1; then
+                ( cd "$repo" && sha256sum "${new_assets[@]}" ) > "SHA256SUMS-$s.txt"
+                gh release create "$hist_tag" "$staged/manifest.json" \
+                  "SHA256SUMS-$s.txt" \
+                  --title "$s $evr" \
+                  --notes "Halo kernel build for $s: $evr. Manifest and checksums; the debs live on the apt-$s rolling release." \
+                  --target "$GITHUB_SHA"
+              fi
+            fi
+
+            # Live acceptance gate on EVERY publish: a stock container OF THE
+            # TARGET SERIES (its client must resolve the meta's own-series
+            # deps — e.g. resolute's linux-main-modules-* do not exist in
+            # noble's archive) against the REAL https release URL, with the
+            # public key asset fetched from the release itself. Nothing is
+            # mounted except that one key file; no secrets cross into the
+            # container.
+            local keydir="key-$s"
+            rm -rf "$keydir"
+            gh release download "apt-$s" --pattern repo-public-key.asc \
+              --dir "$keydir" --clobber
+            docker run --rm -e HALO_SERIES="$s" -e HALO_BASE_URL="$ORIGIN_URL" \
+              -v "$PWD/$keydir/repo-public-key.asc:/halo-key.asc:ro" \
+              "ubuntu:$s" bash -c '
+                set -eux -o pipefail
+                apt-get update -qq
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                  ca-certificates gnupg >/dev/null
+                gpg --dearmor -o /etc/apt/trusted.gpg.d/halo.gpg /halo-key.asc
+                echo "deb [signed-by=/etc/apt/trusted.gpg.d/halo.gpg] $HALO_BASE_URL/apt-$HALO_SERIES/ /" \
+                  > /etc/apt/sources.list.d/halo.list
+                apt-get update
+                apt-get -s install "linux-image-halo-$HALO_SERIES" | tee /tmp/sim.txt
+                grep -q "^Inst linux-image-halo-$HALO_SERIES " /tmp/sim.txt
+              '
+          }
+
+          for s in $SERIES_LIST; do
+            if [ "${MODE[$s]}" = skip ]; then continue; fi
+            echo "=== $s: ${MODE[$s]} ==="
+            publish_series "$s" "${MODE[$s]}"
+          done
+          echo "Publish complete."
