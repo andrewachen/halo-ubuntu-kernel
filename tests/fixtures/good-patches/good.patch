@@ -1,0 +1,15 @@
+From: fixture <fixture@localhost>
+Subject: [PATCH] good: exact-context insertion into hello.c
+
+Full 3/3 context, every context line matches tests/fixtures/mini-tree
+verbatim, so this applies at --fuzz=0 (the setting build-kernel.sh uses).
+--- a/hello.c
++++ b/hello.c
+@@ -1,6 +1,7 @@
+ #include <stdio.h>
+
++/* good patch line */
+ void hello(void)
+ {
+ 	printf("hello from the mini tree\n");
+ }

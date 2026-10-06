@@ -1,0 +1,7 @@
+out/
+*.deb
+tests/fixtures/dummy*
+dev/images.env
+# the PRIVATE signing-subkey export lives in the repo tree on purpose (the
+# machine that publishes owns the key) but must never enter history
+keys/repo-signing-subkeys.asc
