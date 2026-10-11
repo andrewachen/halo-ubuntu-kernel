@@ -428,10 +428,10 @@ test_install_persistent_kernel_protection_hook() {
     echo "the conf must register the script as a DPkg::Post-Invoke" >&2; return 1; }
   grep -qF "chmod 0755 /usr/lib/halo-ubuntu-kernel/keep-kernels" "$SCRIPT" || {
     echo "the hook script must be executable" >&2; return 1; }
-  # the script's core: derive installed kernel image/modules packages from
+  # the script's core: derive installed kernel images + modules-extra from
   # dpkg-query with the fixed-width status filter, then apt-mark manual them
-  grep -qF "'linux-image-*[0-9]*-generic' 'linux-modules-*[0-9]*-generic'" "$SCRIPT" || {
-    echo "the hook must query both image and modules package shapes" >&2; return 1; }
+  grep -qF "'linux-image-*[0-9]*-generic' 'linux-modules-extra-*[0-9]*-generic'" "$SCRIPT" || {
+    echo "the hook must query the image and modules-extra package shapes" >&2; return 1; }
   grep -qF "awk -F'\\t' '\$1 ~ /^ii ?\$/{print \$2}'" "$SCRIPT" \
     || grep -qF "awk -F'\\t' '\$1 ~ /^ii ?\$/ {print \$2}'" "$SCRIPT" \
     || { echo "the hook must filter on the installed status abbreviation" >&2; return 1; }
@@ -444,4 +444,35 @@ test_install_persistent_kernel_protection_hook() {
   [ -n "$ins" ] && [ -n "$hook" ] || { echo "hook ordering test could not locate its anchors" >&2; return 1; }
   [ "$ins" -lt "$hook" ] || {
     echo "the persistent hook (line $hook) must be installed after the real install (line $ins)" >&2; return 1; }
+}
+
+test_install_hook_marks_images_and_extra_only_and_strict_when_explicit() {
+  # the embedded guard must mark kernel IMAGES and their modules-extra
+  # packages, and nothing else. Base modules packages are a hard Depends of
+  # their image, so they ride the image's manual mark for free — marking
+  # them manual would strand orphans on each ABI bump. modules-extra is
+  # different: it is pulled in only as a Depends of the stock metapackage,
+  # so with the metas removed nothing holds it but its own manual flag — an
+  # unmarked modules-extra of a retained fallback image can be swept while
+  # the image itself survives, breaking the fallback (root filesystem / raid
+  # drivers live there). Accepted trade: a marked modules-extra
+  # hard-Depends on its base modules, so after an ABI's
+  # image is pruned, extra+base modules both strand until purged together.
+  # Under an explicit invocation (outside any apt transaction) a failed mark
+  # must be fatal (--strict); under Post-Invoke it stays best-effort so the
+  # guard can never fail the apt run that invoked it.
+  local hook
+  hook=$(sed -n '/cat > \/usr\/lib\/halo-ubuntu-kernel\/keep-kernels <<.EOF.$/,/^EOF$/p' "$SCRIPT")
+  [ -n "$hook" ] || { echo "could not extract the keep-kernels hook body" >&2; return 1; }
+  grep -qF "'linux-image-*[0-9]*-generic'" <<<"$hook" || {
+    echo "the hook must query installed kernel images" >&2; return 1; }
+  grep -qF "'linux-modules-extra-*[0-9]*-generic'" <<<"$hook" || {
+    echo "the hook must query installed modules-extra packages (pulled in only by the stock metapackage; unmarked they are autoremovable while the fallback image survives)" >&2; return 1; }
+  if grep -qF "'linux-modules-*[0-9]*-generic'" <<<"$hook"; then
+    echo "the hook must not mark base modules packages (hard Depends of their images; marking them manual strands orphans on every ABI bump)" >&2; return 1
+  fi
+  grep -qF '[ "$1" = "--strict" ] && exec apt-mark manual $pkgs' <<<"$hook" || {
+    echo "the hook must expose --strict, where a failed mark is fatal" >&2; return 1; }
+  grep -qF '/usr/lib/halo-ubuntu-kernel/keep-kernels --strict' "$SCRIPT" || {
+    echo "install.sh must invoke the guard explicitly with --strict, outside the install transaction" >&2; return 1; }
 }

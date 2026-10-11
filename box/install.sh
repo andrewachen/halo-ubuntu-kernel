@@ -7,7 +7,7 @@
 # SIMULATED first — an apt-get -s that would remove a firmware, microcode, or
 # unexpected kernel package aborts before any real change. Firmware is marked
 # manual before install; afterwards a persistent dpkg post-invoke hook
-# re-marks every installed kernel image and modules package as manual, so
+# re-marks every installed kernel image and modules-extra package as manual, so
 # autoremove can never strand firmware or a fallback kernel across future
 # upgrades. The stock metas are removed by the install itself (expected); any
 # stock metas still installed are held, dpkg-query derived, nothing hardcoded.
@@ -47,7 +47,7 @@ no extra keys) before the apt source is enabled, and the installation is
 SIMULATED first — an apt-get -s that would remove a firmware, microcode, or
 unexpected kernel package aborts before any real change. Firmware is marked
 manual before install; afterwards a persistent dpkg post-invoke hook
-re-marks every installed kernel image and modules package as manual, so
+re-marks every installed kernel image and modules-extra package as manual, so
 autoremove can never strand firmware or a fallback kernel across future
 upgrades. The stock metas are removed by the install itself (expected); any
 stock metas still installed are held, dpkg-query derived, nothing hardcoded.
@@ -285,27 +285,54 @@ EOF
   echo "install.sh: installing the persistent kernel-protection hook ..." >&2
   mkdir -p /usr/lib/halo-ubuntu-kernel /etc/apt/apt.conf.d
   # Persistent protection for FUTURE upgrades: after every apt/dpkg run, re-mark
-  # every installed kernel image and modules package as manual, so autoremove
-  # can never sweep a fallback kernel away when a later meta upgrade drops the
-  # old image from its dependency chain. Mirrors update-notifier's
+  # every installed kernel image and modules-extra package as manual, so
+  # autoremove can never sweep a fallback kernel away when a later meta upgrade
+  # drops the old image from its dependency chain. Base modules packages are
+  # deliberately NOT marked: they are a hard Depends of their image, so they
+  # ride its manual mark for free (marking them too would strand orphans on
+  # every ABI bump). modules-extra is the exception: the stock metapackage is
+  # what pulls it in (a hard Depends), so once the metas are gone the image's
+  # manual mark protects nothing extra and autoremove can strip it out from
+  # under a surviving fallback image. KNOWN TRADE: a marked
+  # modules-extra hard-Depends on its base modules, so after an image is
+  # explicitly pruned, that ABI's extra+base modules both strand until purged
+  # — when pruning an old ABI, purge the image AND its modules-extra together,
+  # then autoremove sweeps the orphaned base modules. Mirrors update-notifier's
   # 01autoremove-kernels mechanism (a DPkg::Post-Invoke guard script).
   cat > /usr/lib/halo-ubuntu-kernel/keep-kernels <<'EOF'
 #!/bin/sh
 # Installed by halo-ubuntu-kernel box/install.sh. After every apt/dpkg run,
-# re-mark every installed kernel image and modules package as manually
+# re-mark every installed kernel image and modules-extra package as manually
 # installed: fallback kernels must survive autoremove across future meta
-# upgrades (mirrors update-notifier's 01autoremove-kernels guard).
+# upgrades (mirrors update-notifier's 01autoremove-kernels guard). IMAGES AND
+# MODULES-EXTRA ONLY, deliberately: base modules packages ride their image's
+# hard Depends (marking them would strand orphans on every ABI bump), while
+# modules-extra is pulled in only by the stock metapackage, so once the
+# metas are removed it must be marked to survive autoremove. Known trade: a
+# marked modules-extra hard-Depends on
+# its base modules, so once an ABI's image is pruned its extra+base modules
+# strand until purged together. Best-effort: the dpkg lock is held during
+# Post-Invoke, so a failed mark cannot be surfaced here.
 pkgs=$(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\n' \
-         'linux-image-*[0-9]*-generic' 'linux-modules-*[0-9]*-generic' 2>/dev/null \
+         'linux-image-*[0-9]*-generic' 'linux-modules-extra-*[0-9]*-generic' 2>/dev/null \
        | awk -F'\t' '$1 ~ /^ii ?$/ {print $2}')
-[ -n "$pkgs" ] && apt-mark manual $pkgs >/dev/null 2>&1
+[ -n "$pkgs" ] || exit 0
+# --strict: invoked outside any apt transaction, where a failed mark must be
+# fatal. Unflagged (the dpkg Post-Invoke hook) never fails the apt run that
+# invoked us.
+[ "$1" = "--strict" ] && exec apt-mark manual $pkgs
+apt-mark manual $pkgs >/dev/null 2>&1
 # never fail the apt run that invoked us
 exit 0
 EOF
   chmod 0755 /usr/lib/halo-ubuntu-kernel/keep-kernels
+  # Post-Invoke fires while the invoking apt still holds the dpkg frontend
+  # lock, so the apt-mark inside can silently fail; run the guard once here,
+  # outside any transaction, where a failed mark is fatal.
+  /usr/lib/halo-ubuntu-kernel/keep-kernels --strict || die "keep-kernels --strict failed"
   cat > /etc/apt/apt.conf.d/99-halo-keep-kernels <<'EOF'
 // Installed by halo-ubuntu-kernel box/install.sh: after every apt/dpkg run,
-// keep every installed kernel image and modules package marked manual so
+// keep every installed kernel image and modules-extra package marked manual so
 // autoremove never removes a fallback kernel. See
 // /usr/lib/halo-ubuntu-kernel/keep-kernels.
 DPkg::Post-Invoke { "/usr/lib/halo-ubuntu-kernel/keep-kernels" };
@@ -320,7 +347,11 @@ install.sh: DONE — linux-image-halo-$series installed from $base.
   were removed by this install (expected). Future autoremoves can never touch
   linux-firmware, the microcode packages or any installed kernel: the
   post-invoke hook (/etc/apt/apt.conf.d/99-halo-keep-kernels) re-marks every
-  installed kernel image and modules package manual after every apt run.
+  installed kernel image and modules-extra manual after every apt run.
+- To prune an old ABI later, purge its image AND modules-extra together
+  ('sudo apt purge linux-image-*-<abi>-generic linux-modules-extra-*-<abi>-generic');
+  autoremove then sweeps the orphaned base modules. Pruning the image alone
+  leaves both module packages stranded (the image's manual extra pins them).
 EOF
 }
 
