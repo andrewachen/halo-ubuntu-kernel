@@ -74,8 +74,8 @@ index 2f866be40..87578d09a 100644
  #include <linux/pci.h>
  #include <linux/pci-p2pdma.h>
  #include <linux/apple-gmux.h>
-@@ -4388,6 +4389,28 @@ static void amdgpu_device_sys_interface_fini(struct amdgpu_device *adev)
- 	amdgpu_uma_sysfs_fini(adev);
+@@ -4451,6 +4451,28 @@
+ 		       apple_gmux_detect(NULL, NULL)));
  }
  
 +static inline bool amdgpu_device_identity(struct amdgpu_device *adev)
